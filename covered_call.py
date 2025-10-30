@@ -70,9 +70,9 @@ def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
     """
     ticker = yf.Ticker(symbol)
     underlying_price = _get_underlying_price(ticker)
-    logger.log('Getting underlying price')
+    logger.info('Getting underlying price')
     if underlying_price is None or underlying_price <= 0:
-        logger.log('No underlying price')
+        logger.exception('No underlying price')
         return []
 
     try:
@@ -85,7 +85,7 @@ def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     days_to_expiry = _calculate_days_to_expiry(expiry_dt)
     if days_to_expiry == 0:
-        logger.log('days_to_expiry == 0')
+        logger.exception('days_to_expiry == 0')
         return []
 
     results: List[OptionQuote] = []
