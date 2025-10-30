@@ -7,6 +7,10 @@ from typing import List, Optional
 import pandas as pd
 import yfinance as yf
 
+import logging
+logger = logging.getLogger(__name__)
+
+
 
 @dataclass
 class OptionQuote:
@@ -72,7 +76,8 @@ def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
     try:
         option_chain = ticker.option_chain(expiry)
         calls_df = option_chain.calls
-    except Exception:
+    except Exception as exc:
+        logger.exception("Failed to load option chain for %s %s", symbol, expiry)
         return []
 
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
