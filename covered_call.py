@@ -70,6 +70,7 @@ def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
     """
     ticker = yf.Ticker(symbol)
     underlying_price = _get_underlying_price(ticker)
+    logger.log('Getting underlying price')
     if underlying_price is None or underlying_price <= 0:
         logger.log('No underlying price')
         return []
