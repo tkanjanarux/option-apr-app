@@ -8,6 +8,7 @@ from covered_call import (
     OptionQuote,
     fetch_cash_secured_put_quotes,
     fetch_covered_call_quotes,
+    get_fetch_stats,
     list_option_expiries,
 )
 
@@ -126,8 +127,21 @@ def main() -> None:
 
     for expiry in selected_expiries:
         quotes = quotes_by_expiry.get(expiry, [])
+        option_type_key = "call" if strategy == "Covered Call" else "put"
+        stats = get_fetch_stats(symbol, expiry, option_type_key)
         if not quotes:
             st.info(f"No {strategy.lower()} quotes found for {expiry}.")
+            if stats:
+                caption = (
+                    f"Diagnostics — total: {stats.get('total_rows', 0)}, "
+                    f"kept: {stats.get('kept', 0)}, "
+                    f"missing bid: {stats.get('missing_bid', 0)}, "
+                    f"not OTM: {stats.get('not_otm', 0)}, "
+                    f"invalid strike: {stats.get('invalid_strike', 0)}"
+                )
+                if stats.get("error"):
+                    caption += f", error: {stats['error']}"
+                st.caption(caption)
             continue
 
         df = quotes_to_dataframe(quotes)
@@ -144,6 +158,17 @@ def main() -> None:
         available_columns = [c for c in display_columns if c in df.columns]
         st.markdown(f"**{strategy} - Expiry: {expiry} - {days_to_expiry} days remaining**")
         st.dataframe(df[available_columns].head(top_n))
+        if stats:
+            caption = (
+                f"Diagnostics — total: {stats.get('total_rows', 0)}, "
+                f"kept: {stats.get('kept', 0)}, "
+                f"missing bid: {stats.get('missing_bid', 0)}, "
+                f"not OTM: {stats.get('not_otm', 0)}, "
+                f"invalid strike: {stats.get('invalid_strike', 0)}"
+            )
+            if stats.get("error"):
+                caption += f", error: {stats['error']}"
+            st.caption(caption)
 
 if __name__ == "__main__":
     main()
