@@ -145,7 +145,7 @@ def main() -> None:
             continue
 
         df = quotes_to_dataframe(quotes)
-        df["APR (%)"] = df["apr"].round(2)
+        df["APR (%)"] = df["apr"].apply(lambda value: f"{value:.2f}" if pd.notna(value) else "")
         df["Premium ($)"] = df["premium"].round(2)
         df["Strike ($)"] = df.apply(
             lambda row: format_strike_with_percent(row["strike"], row.get("underlying_price")),
