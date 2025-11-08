@@ -4,13 +4,9 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-from covered_call import (
-    OptionQuote,
-    fetch_cash_secured_put_quotes,
-    fetch_covered_call_quotes,
-    get_fetch_stats,
-    list_option_expiries,
-)
+import bybit_api
+import covered_call as yfinance_api
+from shared_types import OptionQuote
 
 
 def quotes_to_dataframe(quotes: List[OptionQuote]) -> pd.DataFrame:
@@ -48,7 +44,13 @@ def format_strike_with_percent(strike: float, underlying: float) -> str:
 def _days_until(expiry: str) -> int:
     from datetime import datetime, timezone
 
-    expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    try:
+        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            expiry_dt = datetime.strptime(expiry, "%d%b%y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            expiry_dt = datetime.strptime(expiry, "%Y%m%d").replace(tzinfo=timezone.utc)
     today = datetime.now(timezone.utc).date()
     return max((expiry_dt.date() - today).days, 0)
 
@@ -60,6 +62,12 @@ def main() -> None:
         "Enter an equity ticker to view annualized returns for covered calls or cash-secured puts."
     )
 
+    data_source = st.radio(
+        "Data Source",
+        options=["yfinance", "Bybit"],
+        horizontal=True,
+    )
+
     strategy = st.radio(
         "Strategy",
         options=["Covered Call", "Cash-Secured Put"],
@@ -68,7 +76,10 @@ def main() -> None:
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        symbol = st.text_input("Underlying symbol", value="AAPL").upper().strip()
+        if data_source == "Bybit":
+            symbol = st.text_input("Underlying symbol", value="BTC").upper().strip()
+        else:
+            symbol = st.text_input("Underlying symbol", value="AAPL").upper().strip()
     with col2:
         top_n = st.number_input("Show top N by APR", min_value=5, max_value=100, value=25, step=5)
 
@@ -76,7 +87,12 @@ def main() -> None:
         st.info("Provide a ticker symbol to load available expirations.")
         return
 
-    expiries = list_option_expiries(symbol)
+    if data_source == "yfinance":
+        api = yfinance_api
+    else:
+        api = bybit_api
+
+    expiries = api.list_option_expiries(symbol)
     if not expiries:
         st.warning("No options expirations found. Check the symbol and try again.")
         return
@@ -94,9 +110,9 @@ def main() -> None:
         return
 
     fetch_fn = (
-        fetch_covered_call_quotes
+        api.fetch_covered_call_quotes
         if strategy == "Covered Call"
-        else fetch_cash_secured_put_quotes
+        else api.fetch_cash_secured_put_quotes
     )
 
     with st.spinner("Fetching option chain…"):
@@ -127,21 +143,8 @@ def main() -> None:
 
     for expiry in selected_expiries:
         quotes = quotes_by_expiry.get(expiry, [])
-        option_type_key = "call" if strategy == "Covered Call" else "put"
-        stats = get_fetch_stats(symbol, expiry, option_type_key)
         if not quotes:
             st.info(f"No {strategy.lower()} quotes found for {expiry}.")
-            if stats:
-                caption = (
-                    f"Diagnostics — total: {stats.get('total_rows', 0)}, "
-                    f"kept: {stats.get('kept', 0)}, "
-                    f"missing bid: {stats.get('missing_bid', 0)}, "
-                    f"not OTM: {stats.get('not_otm', 0)}, "
-                    f"invalid strike: {stats.get('invalid_strike', 0)}"
-                )
-                if stats.get("error"):
-                    caption += f", error: {stats['error']}"
-                st.caption(caption)
             continue
 
         df = quotes_to_dataframe(quotes)
@@ -153,22 +156,12 @@ def main() -> None:
         )
         df["Days to Expiry"] = df["days_to_expiry"].astype(int)
         days_to_expiry = int(df["Days to Expiry"].iloc[0])
-        df = df.sort_values("APR (%)", ascending=False)
+        sort_ascending = strategy == "Covered Call"
+        df = df.sort_values("strike", ascending=sort_ascending)
 
         available_columns = [c for c in display_columns if c in df.columns]
         st.markdown(f"**{strategy} - Expiry: {expiry} - {days_to_expiry} days remaining**")
         st.dataframe(df[available_columns].head(top_n))
-        if stats:
-            caption = (
-                f"Diagnostics — total: {stats.get('total_rows', 0)}, "
-                f"kept: {stats.get('kept', 0)}, "
-                f"missing bid: {stats.get('missing_bid', 0)}, "
-                f"not OTM: {stats.get('not_otm', 0)}, "
-                f"invalid strike: {stats.get('invalid_strike', 0)}"
-            )
-            if stats.get("error"):
-                caption += f", error: {stats['error']}"
-            st.caption(caption)
 
 if __name__ == "__main__":
     main()
