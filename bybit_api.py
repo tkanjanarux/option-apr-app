@@ -39,7 +39,20 @@ def _get_setting(key: str) -> Optional[str]:
     return None
 
 
-_BASE_URL = _get_setting("BYBIT_API_BASE_URL") or "https://api.bybit.com"
+def _get_setting_with_source(key: str) -> Tuple[Optional[str], Optional[str]]:
+    env_value = os.environ.get(key)
+    if env_value:
+        return env_value, "env"
+    secrets = getattr(_st, "secrets", None)
+    if secrets and key in secrets:
+        value = secrets[key]
+        str_value = str(value) if value is not None else None
+        return str_value, "secret"
+    return None, None
+
+
+_base_url_value, _base_url_source = _get_setting_with_source("BYBIT_API_BASE_URL")
+_BASE_URL = _base_url_value or "https://api.bybit.com"
 _HTTP_PROXY = _get_setting("BYBIT_HTTP_PROXY")
 _USER_AGENT = _get_setting("BYBIT_API_USER_AGENT") or "option-apr-app/1.0"
 _REQUEST_TIMEOUT = float(_get_setting("BYBIT_HTTP_TIMEOUT") or 10.0)
@@ -49,7 +62,8 @@ _session.headers.update({"User-Agent": _USER_AGENT})
 if _HTTP_PROXY:
     _session.proxies.update({"http": _HTTP_PROXY, "https": _HTTP_PROXY})
     debug_log.log(f"Bybit proxy configured for requests session: {_HTTP_PROXY}")
-debug_log.log(f"Bybit API base URL: {_BASE_URL}")
+base_url_source = _base_url_source or "default"
+debug_log.log(f"Bybit API base URL ({base_url_source}): {_BASE_URL}")
 
 
 def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
