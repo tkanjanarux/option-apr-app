@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pybit.unified_trading import HTTP
 
@@ -12,16 +12,39 @@ from shared_types import OptionQuote
 
 
 class BybitAPIError(RuntimeError):
-    pass
+    """Generic error raised when Bybit public endpoints fail."""
 
 
 class BybitAPIForbidden(BybitAPIError):
-    pass
+    """Raised when Bybit rejects the IP for compliance or rate limits."""
 
 
 def get_bybit_client() -> HTTP:
     """Return a public Bybit HTTP client for option endpoints."""
     return HTTP(testnet=False)
+
+
+def _raise_api_error(action: str, message: str, *, exc: Optional[Exception] = None) -> None:
+    debug_log.log(f"Bybit error during {action}: {message}")
+    message_lower = message.lower()
+    if "403" in message or "blocked" in message_lower:
+        raise BybitAPIForbidden(
+            f"{action} failed: {message}. Bybit may be blocking this IP."
+        ) from exc
+    raise BybitAPIError(f"{action} failed: {message}") from exc
+
+
+def _call_api(action: str, request_fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        response = request_fn()
+    except Exception as exc:  # pragma: no cover - network failures
+        _raise_api_error(action, str(exc), exc=exc)
+
+    if not (response and response.get("retCode") == 0):
+        message = response.get("retMsg") if response else "Unknown error"
+        _raise_api_error(action, message)
+
+    return response.get("result", {})
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -33,21 +56,19 @@ def _to_float(value: Any) -> Optional[float]:
 
 def _get_underlying_price(client: HTTP, symbol: str) -> Optional[float]:
     spot_symbol = f"{symbol.upper()}USDT"
-    try:
-        ticker_response = client.get_tickers(category="spot", symbol=spot_symbol)
-        if (
-            ticker_response
-            and ticker_response.get("retCode") == 0
-            and ticker_response.get("result", {}).get("list")
-        ):
-            price = float(ticker_response["result"]["list"][0]["lastPrice"])
+    result = _call_api(
+        f"fetch underlying price for {spot_symbol}",
+        lambda: client.get_tickers(category="spot", symbol=spot_symbol),
+    )
+
+    ticker_list = result.get("list", [])
+    if ticker_list:
+        price = _to_float(ticker_list[0].get("lastPrice"))
+        if price is not None:
             debug_log.log(f"Bybit underlying price for {spot_symbol}: {price}")
             return price
-        debug_log.log(
-            f"Bybit underlying response missing data for {spot_symbol}: {ticker_response}"
-        )
-    except Exception as exc:  # pragma: no cover - network failure
-        debug_log.log(f"Could not fetch underlying {symbol} price from Bybit: {exc}")
+
+    debug_log.log(f"Bybit underlying response missing data for {spot_symbol}: {result}")
     return None
 
 
@@ -57,82 +78,36 @@ def _normalize_premium(premium_quote: Optional[float]) -> Optional[float]:
 
 
 @lru_cache(maxsize=8)
-def _get_all_instruments_cached(base_coin: str) -> List[Dict[str, Any]]:
-    """Fetch all option instruments for a base coin (handles pagination)."""
+def _get_all_instruments(base_coin: str) -> List[Dict[str, Any]]:
+    """Return the full instrument list for a base coin (cached)."""
+    client = get_bybit_client()
     instruments: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
-    local_client = get_bybit_client()
+
     while True:
-        try:
-            response = local_client.get_instruments_info(
-                category="option",
-                baseCoin=base_coin,
-                cursor=cursor,
-            )
-        except Exception as exc:  # pragma: no cover
-            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
-            break
-
-        if not (response and response.get("retCode") == 0):
-            error_msg = response.get("retMsg") if response else "Unknown error"
-            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
-            break
-
-        result = response.get("result", {})
+        result = _call_api(
+            f"list instruments for {base_coin}",
+            lambda cursor=cursor: client.get_instruments_info(
+                category="option", baseCoin=base_coin, cursor=cursor
+            ),
+        )
         instruments.extend(result.get("list", []))
         cursor = result.get("nextPageCursor")
         if not cursor:
             break
 
-    return instruments
-
-
-def _get_all_instruments(client: HTTP, base_coin: str) -> List[Dict[str, Any]]:
-    instruments = _get_all_instruments_cached(base_coin)
-    if instruments:
-        return instruments
-
-    instruments = []
-    cursor: Optional[str] = None
-    while True:
-        try:
-            response = client.get_instruments_info(
-                category="option",
-                baseCoin=base_coin,
-                cursor=cursor,
-            )
-        except Exception as exc:  # pragma: no cover
-            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
-            break
-
-        if not (response and response.get("retCode") == 0):
-            error_msg = response.get("retMsg") if response else "Unknown error"
-            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
-            break
-
-        result = response.get("result", {})
-        instruments.extend(result.get("list", []))
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-
+    debug_log.log(f"Bybit instruments for {base_coin}: {len(instruments)} rows")
     return instruments
 
 
 def _get_option_tickers(client: HTTP, base_coin: str) -> Dict[str, Dict[str, Any]]:
     """Return the latest quotes for every option under the base coin."""
-    try:
-        response = client.get_tickers(category="option", baseCoin=base_coin)
-    except Exception as exc:  # pragma: no cover
-        debug_log.log(f"Failed to fetch option tickers for {base_coin}: {exc}")
-        return {}
+    result = _call_api(
+        f"fetch option tickers for {base_coin}",
+        lambda: client.get_tickers(category="option", baseCoin=base_coin),
+    )
 
-    if not (response and response.get("retCode") == 0):
-        error_msg = response.get("retMsg") if response else "Unknown error"
-        debug_log.log(f"Error fetching option tickers for {base_coin}: {error_msg}")
-        return {}
-
-    ticker_list = response.get("result", {}).get("list", [])
+    ticker_list = result.get("list", [])
     target_symbol = "BTC-10NOV25-102000-P-USDT"
     for item in ticker_list:
         if item.get("symbol") == target_symbol:
@@ -143,18 +118,11 @@ def _get_option_tickers(client: HTTP, base_coin: str) -> Dict[str, Dict[str, Any
 
 def _get_ticker_for_symbol(client: HTTP, option_symbol: str) -> Optional[Dict[str, Any]]:
     """Fetch a single option ticker snapshot when bulk call misses a symbol."""
-    try:
-        response = client.get_tickers(category="option", symbol=option_symbol)
-    except Exception as exc:  # pragma: no cover
-        debug_log.log(f"Failed to fetch ticker for {option_symbol}: {exc}")
-        return None
-
-    if not (response and response.get("retCode") == 0):
-        error_msg = response.get("retMsg") if response else "Unknown error"
-        debug_log.log(f"Error fetching ticker for {option_symbol}: {error_msg}")
-        return None
-
-    ticker_list = response.get("result", {}).get("list", [])
+    result = _call_api(
+        f"fetch ticker for {option_symbol}",
+        lambda: client.get_tickers(category="option", symbol=option_symbol),
+    )
+    ticker_list = result.get("list", [])
     return ticker_list[0] if ticker_list else None
 
 
@@ -181,8 +149,7 @@ def _parse_option_symbol(option_symbol: str) -> Optional[Tuple[str, float, str]]
 
 def list_option_expiries(symbol: str) -> List[str]:
     base_coin = symbol.upper()
-    client = get_bybit_client()
-    instruments = _get_all_instruments(client, base_coin)
+    instruments = _get_all_instruments(base_coin)
     expiries = set()
     for instrument in instruments:
         parsed = _parse_option_symbol(instrument.get("symbol", ""))
@@ -207,7 +174,7 @@ def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[Opti
         debug_log.log(f"Could not determine underlying price for {symbol}.")
         return []
 
-    instrument_list = _get_all_instruments(client, base_coin)
+    instrument_list = _get_all_instruments(base_coin)
     if not instrument_list:
         debug_log.log(f"No instruments returned for {symbol.upper()} when fetching {expiry}.")
         return []

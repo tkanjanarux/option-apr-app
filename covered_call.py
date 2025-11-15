@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import pandas as pd
 import yfinance as yf
-
-
-
-
 
 from shared_types import OptionQuote
 
 
 def _get_underlying_price(ticker: yf.Ticker) -> Optional[float]:
-    """Return the latest close price for the underlying symbol."""
+    """Return the latest available spot price for the ticker."""
     try:
         price = ticker.fast_info.get("lastPrice")
         if price:
@@ -34,19 +29,11 @@ def _get_underlying_price(ticker: yf.Ticker) -> Optional[float]:
 
 
 def _calculate_premium(row: pd.Series) -> Optional[float]:
-    """Use the bid price as the option premium."""
-    bid = row.get("bid")
-    if bid is not None and not pd.isna(bid) and bid > 0:
-        return float(bid)
-
-    last_price = row.get("lastPrice")
-    if last_price is not None and not pd.isna(last_price) and last_price > 0:
-        return float(last_price)
-
-    ask = row.get("ask")
-    if ask is not None and not pd.isna(ask) and ask > 0:
-        return float(ask)
-
+    """Return the best available premium for a row in the chain."""
+    for field in ("bid", "lastPrice", "ask"):
+        value = row.get(field)
+        if value is not None and not pd.isna(value) and value > 0:
+            return float(value)
     return None
 
 
@@ -56,30 +43,32 @@ def _calculate_days_to_expiry(expiry: datetime) -> int:
     return max((expiry_date - today).days, 0)
 
 
-
+def _load_option_frame(
+    ticker: yf.Ticker, symbol: str, expiry: str, option_type: str
+) -> Optional[pd.DataFrame]:
+    try:
+        chain = ticker.option_chain(expiry)
+        return chain.calls if option_type == "call" else chain.puts
+    except Exception:
+        print(f"Failed to load {option_type} option chain for {symbol} {expiry}")
+        return None
 
 
 def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
-    """
-    Fetch call options for the given symbol and expiry and compute covered call APR.
-    """
     ticker = yf.Ticker(symbol)
     underlying_price = _get_underlying_price(ticker)
     if underlying_price is None or underlying_price <= 0:
-        print("No underlying price for %s", symbol)
+        print(f"No underlying price for {symbol}")
         return []
 
-    try:
-        option_chain = ticker.option_chain(expiry)
-        calls_df = option_chain.calls
-    except Exception as exc:
-        print("Failed to load call option chain for %s %s", symbol, expiry)
+    calls_df = _load_option_frame(ticker, symbol, expiry, "call")
+    if calls_df is None or calls_df.empty:
         return []
 
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     days_to_expiry = _calculate_days_to_expiry(expiry_dt)
     if days_to_expiry == 0:
-        print("Covered call %s %s has non-positive days_to_expiry", symbol, expiry)
+        print(f"Covered call {symbol} {expiry} has non-positive days_to_expiry")
         return []
 
     results: List[OptionQuote] = []
@@ -116,7 +105,6 @@ def fetch_covered_call_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
 
 
 def list_option_expiries(symbol: str) -> List[str]:
-    """Return available expiry dates for the given symbol."""
     ticker = yf.Ticker(symbol)
     try:
         return list(ticker.options)
@@ -125,27 +113,20 @@ def list_option_expiries(symbol: str) -> List[str]:
 
 
 def fetch_cash_secured_put_quotes(symbol: str, expiry: str) -> List[OptionQuote]:
-    """
-    Fetch put options for the given symbol and expiry and compute cash-secured put APR.
-    APR is calculated as (premium / strike) annualized.
-    """
     ticker = yf.Ticker(symbol)
     underlying_price = _get_underlying_price(ticker)
     if underlying_price is None or underlying_price <= 0:
-        print("No underlying price for %s", symbol)
+        print(f"No underlying price for {symbol}")
         return []
 
-    try:
-        option_chain = ticker.option_chain(expiry)
-        puts_df = option_chain.puts
-    except Exception:
-        print("Failed to load put option chain for %s %s", symbol, expiry)
+    puts_df = _load_option_frame(ticker, symbol, expiry, "put")
+    if puts_df is None or puts_df.empty:
         return []
 
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     days_to_expiry = _calculate_days_to_expiry(expiry_dt)
     if days_to_expiry == 0:
-        print("Cash-secured put %s %s has non-positive days_to_expiry", symbol, expiry)
+        print(f"Cash-secured put {symbol} {expiry} has non-positive days_to_expiry")
         return []
 
     results: List[OptionQuote] = []
@@ -155,10 +136,7 @@ def fetch_cash_secured_put_quotes(symbol: str, expiry: str) -> List[OptionQuote]
             continue
 
         strike = float(row["strike"])
-        if strike >= underlying_price:
-            continue
-
-        if strike <= 0:
+        if strike >= underlying_price or strike <= 0:
             continue
 
         apr = (premium / strike) * (365 / days_to_expiry) * 100

@@ -1,16 +1,31 @@
 from dataclasses import asdict
-from typing import List
+from datetime import datetime, timezone
+from typing import Iterable, List
 
 import pandas as pd
 import streamlit as st
 
 import bybit_api
 import covered_call as yfinance_api
-import debug_log
 from shared_types import OptionQuote
 
 
-def quotes_to_dataframe(quotes: List[OptionQuote]) -> pd.DataFrame:
+DATA_SOURCES = ("yfinance", "Bybit")
+DEFAULT_SYMBOLS = {"yfinance": "AAPL", "Bybit": "BTC"}
+DISPLAY_COLUMNS = ["Strike ($)", "Premium ($)", "APR (%)"]
+NUMERIC_COLUMNS = [
+    "strike",
+    "premium",
+    "underlying_price",
+    "apr",
+    "break_even_price",
+    "bid",
+    "ask",
+    "implied_vol",
+]
+
+
+def quotes_to_dataframe(quotes: Iterable[OptionQuote]) -> pd.DataFrame:
     records = [
         {
             **asdict(quote),
@@ -19,19 +34,9 @@ def quotes_to_dataframe(quotes: List[OptionQuote]) -> pd.DataFrame:
         for quote in quotes
     ]
     df = pd.DataFrame(records)
-    numeric_cols = [
-        "strike",
-        "premium",
-        "underlying_price",
-        "apr",
-        "break_even_price",
-        "bid",
-        "ask",
-        "implied_vol",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in NUMERIC_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
     return df
 
 
@@ -43,17 +48,50 @@ def format_strike_with_percent(strike: float, underlying: float) -> str:
 
 
 def _days_until(expiry: str) -> int:
-    from datetime import datetime, timezone
-
-    try:
-        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
+    for fmt in ("%Y-%m-%d", "%d%b%y", "%Y%m%d"):
         try:
-            expiry_dt = datetime.strptime(expiry, "%d%b%y").replace(tzinfo=timezone.utc)
+            expiry_dt = datetime.strptime(expiry, fmt).replace(tzinfo=timezone.utc)
+            break
         except ValueError:
-            expiry_dt = datetime.strptime(expiry, "%Y%m%d").replace(tzinfo=timezone.utc)
+            continue
+    else:
+        return 0
+
     today = datetime.now(timezone.utc).date()
     return max((expiry_dt.date() - today).days, 0)
+
+
+def _resolve_api(source: str):
+    return yfinance_api if source == "yfinance" else bybit_api
+
+
+def _render_symbol_input(source: str) -> str:
+    default_symbol = DEFAULT_SYMBOLS.get(source, "AAPL")
+    return st.text_input("Underlying symbol", value=default_symbol).upper().strip()
+
+
+def _render_quotes_table(
+    *,
+    expiry: str,
+    quotes: List[OptionQuote],
+    strategy: str,
+    top_n: int,
+) -> None:
+    df = quotes_to_dataframe(quotes)
+    df["APR (%)"] = df["apr"].apply(lambda value: f"{value:.2f}" if pd.notna(value) else "")
+    df["Premium ($)"] = df["premium"].round(2)
+    df["Strike ($)"] = df.apply(
+        lambda row: format_strike_with_percent(row["strike"], row.get("underlying_price")),
+        axis=1,
+    )
+    df["Days to Expiry"] = df["days_to_expiry"].astype(int)
+    days_to_expiry = int(df["Days to Expiry"].iloc[0])
+    sort_ascending = strategy == "Covered Call"
+    df = df.sort_values("strike", ascending=sort_ascending)
+
+    available_columns = [column for column in DISPLAY_COLUMNS if column in df.columns]
+    st.markdown(f"**{strategy} - Expiry: {expiry} - {days_to_expiry} days remaining**")
+    st.dataframe(df[available_columns].head(top_n))
 
 
 def main() -> None:
@@ -63,14 +101,7 @@ def main() -> None:
         "Enter an equity ticker to view annualized returns for covered calls or cash-secured puts."
     )
 
-    show_debug_logs = st.sidebar.checkbox("Show Bybit debug log", value=False)
-    debug_log.clear()
-
-    data_source = st.radio(
-        "Data Source",
-        options=["yfinance", "Bybit"],
-        horizontal=True,
-    )
+    data_source = st.radio("Data Source", options=DATA_SOURCES, horizontal=True)
 
     strategy = st.radio(
         "Strategy",
@@ -80,10 +111,7 @@ def main() -> None:
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        if data_source == "Bybit":
-            symbol = st.text_input("Underlying symbol", value="BTC").upper().strip()
-        else:
-            symbol = st.text_input("Underlying symbol", value="AAPL").upper().strip()
+        symbol = _render_symbol_input(data_source)
     with col2:
         top_n = st.number_input("Show top N by APR", min_value=5, max_value=100, value=25, step=5)
 
@@ -92,10 +120,7 @@ def main() -> None:
             st.info("Provide a ticker symbol to load available expirations.")
             return
 
-        if data_source == "yfinance":
-            api = yfinance_api
-        else:
-            api = bybit_api
+        api = _resolve_api(data_source)
 
         expiries = api.list_option_expiries(symbol)
         if not expiries:
@@ -140,33 +165,12 @@ def main() -> None:
                 apr_caption = "APR = (premium / strike price) * (365 / days to expiry)."
             st.caption(apr_caption)
 
-        display_columns = [
-            "Strike ($)",
-            "Premium ($)",
-            "APR (%)",
-        ]
-
         for expiry in selected_expiries:
             quotes = quotes_by_expiry.get(expiry, [])
             if not quotes:
                 st.info(f"No {strategy.lower()} quotes found for {expiry}.")
                 continue
-
-            df = quotes_to_dataframe(quotes)
-            df["APR (%)"] = df["apr"].apply(lambda value: f"{value:.2f}" if pd.notna(value) else "")
-            df["Premium ($)"] = df["premium"].round(2)
-            df["Strike ($)"] = df.apply(
-                lambda row: format_strike_with_percent(row["strike"], row.get("underlying_price")),
-                axis=1,
-            )
-            df["Days to Expiry"] = df["days_to_expiry"].astype(int)
-            days_to_expiry = int(df["Days to Expiry"].iloc[0])
-            sort_ascending = strategy == "Covered Call"
-            df = df.sort_values("strike", ascending=sort_ascending)
-
-            available_columns = [c for c in display_columns if c in df.columns]
-            st.markdown(f"**{strategy} - Expiry: {expiry} - {days_to_expiry} days remaining**")
-            st.dataframe(df[available_columns].head(top_n))
+            _render_quotes_table(expiry=expiry, quotes=quotes, strategy=strategy, top_n=top_n)
     except bybit_api.BybitAPIForbidden as exc:
         st.error(
             "Bybit rejected the request (HTTP 403). The hosting IP is likely blocked for compliance reasons. "
@@ -177,12 +181,6 @@ def main() -> None:
     except bybit_api.BybitAPIError as exc:
         st.error(f"Unable to load Bybit option data: {exc}")
         return
-    finally:
-        if show_debug_logs:
-            log_text = "\n".join(debug_log.get_logs()) or "No logs captured yet."
-            st.sidebar.text_area("Bybit Debug Log", value=log_text, height=240)
-        elif data_source == "Bybit":
-            st.sidebar.caption("Enable 'Show Bybit debug log' to see request diagnostics.")
 
 if __name__ == "__main__":
     main()
