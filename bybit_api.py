@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from pybit.unified_trading import HTTP
 
 from shared_types import OptionQuote
+import debug_log
 
 
 def get_bybit_client() -> HTTP:
@@ -32,9 +33,14 @@ def _get_underlying_price(client: HTTP, symbol: str) -> Optional[float]:
             and ticker_response.get("retCode") == 0
             and ticker_response.get("result", {}).get("list")
         ):
-            return float(ticker_response["result"]["list"][0]["lastPrice"])
+            price = float(ticker_response["result"]["list"][0]["lastPrice"])
+            debug_log.log(f"Bybit underlying price for {spot_symbol}: {price}")
+            return price
+        debug_log.log(
+            f"Bybit underlying response missing data for {spot_symbol}: {ticker_response}"
+        )
     except Exception as exc:  # pragma: no cover - network failure
-        print(f"Could not fetch underlying {symbol} price from Bybit: {exc}")
+        debug_log.log(f"Could not fetch underlying {symbol} price from Bybit: {exc}")
     return None
 
 
@@ -60,12 +66,12 @@ def _get_all_instruments_cached(base_coin: str) -> List[Dict[str, Any]]:
                 cursor=cursor,
             )
         except Exception as exc:  # pragma: no cover
-            print(f"Failed to list instruments for {base_coin}: {exc}")
+            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
             break
 
         if not (response and response.get("retCode") == 0):
             error_msg = response.get("retMsg") if response else "Unknown error"
-            print(f"Error fetching instruments for {base_coin}: {error_msg}")
+            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
             break
 
         result = response.get("result", {})
@@ -93,12 +99,12 @@ def _get_all_instruments(client: HTTP, base_coin: str) -> List[Dict[str, Any]]:
                 cursor=cursor,
             )
         except Exception as exc:  # pragma: no cover
-            print(f"Failed to list instruments for {base_coin}: {exc}")
+            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
             break
 
         if not (response and response.get("retCode") == 0):
             error_msg = response.get("retMsg") if response else "Unknown error"
-            print(f"Error fetching instruments for {base_coin}: {error_msg}")
+            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
             break
 
         result = response.get("result", {})
@@ -115,19 +121,19 @@ def _get_option_tickers(client: HTTP, base_coin: str) -> Dict[str, Dict[str, Any
     try:
         response = client.get_tickers(category="option", baseCoin=base_coin)
     except Exception as exc:  # pragma: no cover
-        print(f"Failed to fetch option tickers for {base_coin}: {exc}")
+        debug_log.log(f"Failed to fetch option tickers for {base_coin}: {exc}")
         return {}
 
     if not (response and response.get("retCode") == 0):
         error_msg = response.get("retMsg") if response else "Unknown error"
-        print(f"Error fetching option tickers for {base_coin}: {error_msg}")
+        debug_log.log(f"Error fetching option tickers for {base_coin}: {error_msg}")
         return {}
 
     ticker_list = response.get("result", {}).get("list", [])
     target_symbol = "BTC-10NOV25-102000-P-USDT"
     for item in ticker_list:
         if item.get("symbol") == target_symbol:
-            print(f"Bybit get_tickers snapshot for {target_symbol}: {item}")
+            debug_log.log(f"Bybit get_tickers snapshot for {target_symbol}: {item}")
             break
     return {item["symbol"]: item for item in ticker_list}
 
@@ -137,12 +143,12 @@ def _get_ticker_for_symbol(client: HTTP, option_symbol: str) -> Optional[Dict[st
     try:
         response = client.get_tickers(category="option", symbol=option_symbol)
     except Exception as exc:  # pragma: no cover
-        print(f"Failed to fetch ticker for {option_symbol}: {exc}")
+        debug_log.log(f"Failed to fetch ticker for {option_symbol}: {exc}")
         return None
 
     if not (response and response.get("retCode") == 0):
         error_msg = response.get("retMsg") if response else "Unknown error"
-        print(f"Error fetching ticker for {option_symbol}: {error_msg}")
+        debug_log.log(f"Error fetching ticker for {option_symbol}: {error_msg}")
         return None
 
     ticker_list = response.get("result", {}).get("list", [])
@@ -205,18 +211,18 @@ def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[Opti
     client = get_bybit_client()
     underlying_price = _get_underlying_price(client, base_coin)
     if underlying_price is None or underlying_price <= 0:
-        print(f"Could not determine underlying price for {symbol}.")
+        debug_log.log(f"Could not determine underlying price for {symbol}.")
         return []
 
     instrument_list = _get_all_instruments(client, base_coin)
     if not instrument_list:
-        print(f"No instruments returned for {symbol.upper()} when fetching {expiry}.")
+        debug_log.log(f"No instruments returned for {symbol.upper()} when fetching {expiry}.")
         return []
 
     option_tickers = _get_option_tickers(client, base_coin)
 
     quotes: List[OptionQuote] = []
-    print(
+    debug_log.log(
         f"Bybit fetch {symbol.upper()} {option_type} instruments for {expiry}: {len(instrument_list)} rows"
     )
     expiry_dt = datetime.strptime(expiry, "%d%b%y").replace(tzinfo=timezone.utc)
@@ -263,6 +269,7 @@ def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[Opti
             ticker_snapshot = _get_ticker_for_symbol(client, option_symbol)
         if not ticker_snapshot:
             skip_reasons["missing_ticker"] += 1
+            debug_log.log(f"Missing ticker snapshot for {option_symbol}")
             continue
 
         if strike <= 0:
@@ -309,7 +316,7 @@ def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[Opti
             )
         )
 
-    print(
+    debug_log.log(
         f"Bybit {symbol.upper()} {option_type} {expiry}: "
         f"processed={processed}, quotes={len(quotes)}, skips={dict(skip_reasons)}"
     )
