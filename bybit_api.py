@@ -52,6 +52,7 @@ def _get_setting_with_source(key: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 _base_url_value, _base_url_source = _get_setting_with_source("BYBIT_API_BASE_URL")
+_base_urls_setting = _get_setting("BYBIT_API_BASE_URLS")
 _BASE_URL = _base_url_value or "https://api.bybit.com"
 _HTTP_PROXY = _get_setting("BYBIT_HTTP_PROXY")
 _USER_AGENT = _get_setting("BYBIT_API_USER_AGENT") or "option-apr-app/1.0"
@@ -62,22 +63,77 @@ _session.headers.update({"User-Agent": _USER_AGENT})
 if _HTTP_PROXY:
     _session.proxies.update({"http": _HTTP_PROXY, "https": _HTTP_PROXY})
     debug_log.log(f"Bybit proxy configured for requests session: {_HTTP_PROXY}")
-base_url_source = _base_url_source or "default"
-debug_log.log(f"Bybit API base URL ({base_url_source}): {_BASE_URL}")
+
+
+def _normalize_base(url: str) -> str:
+    return url.rstrip("/")
+
+
+def _build_base_url_list() -> List[str]:
+    urls: List[str] = []
+    base_url_source = _base_url_source or "default"
+    if _base_urls_setting:
+        for entry in _base_urls_setting.split(","):
+            trimmed = entry.strip()
+            if trimmed:
+                urls.append(_normalize_base(trimmed))
+        debug_log.log("Bybit base URLs sourced from BYBIT_API_BASE_URLS setting")
+    elif _base_url_value:
+        urls.append(_normalize_base(_base_url_value))
+        debug_log.log(f"Bybit base URL sourced from {_base_url_source}")
+    else:
+        debug_log.log("Bybit base URL falling back to defaults")
+
+    defaults = [
+        _normalize_base(_BASE_URL),
+        "https://api.bytick.com",
+        "https://api.bybitglobal.com",
+    ]
+    for default_url in defaults:
+        if default_url and default_url not in urls:
+            urls.append(default_url)
+
+    debug_log.log(f"Bybit API base URL options: {urls}")
+    return urls
+
+
+_BASE_URLS = _build_base_url_list()
 
 
 def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{_BASE_URL}{path}"
-    debug_log.log(f"Bybit GET {path} params={params}")
+    last_error: Optional[BybitAPIError] = None
+    for base in _BASE_URLS:
+        try:
+            return _request_single(base, path, params=params)
+        except BybitAPIForbidden as exc:
+            last_error = exc
+            debug_log.log(f"Bybit request forbidden for base {base}. Trying next option…")
+            continue
+        except BybitAPIError as exc:
+            last_error = exc
+            # Retry on server-side issues; otherwise, stop.
+            if exc.status_code and exc.status_code >= 500:
+                debug_log.log(f"Bybit server error on {base}, retrying alternate base…")
+                continue
+            break
+
+    if last_error:
+        raise last_error
+    raise BybitAPIError("Failed to contact Bybit: no base URLs available")
+
+
+def _request_single(base_url: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{base_url}{path}"
+    debug_log.log(f"Bybit GET {path} base={base_url} params={params}")
     try:
         response = _session.get(url, params=params, timeout=_REQUEST_TIMEOUT)
     except requests.RequestException as exc:  # pragma: no cover
-        debug_log.log(f"HTTP request to {path} failed: {exc}")
-        raise BybitAPIError(f"Failed to reach Bybit: {exc}") from exc
+        debug_log.log(f"HTTP request to {url} failed: {exc}")
+        raise BybitAPIError(f"Failed to reach Bybit base {base_url}: {exc}") from exc
 
     if response.status_code == 403:
         message = response.text.strip() or response.reason
-        debug_log.log(f"Bybit HTTP 403 for {path}: {message}")
+        debug_log.log(f"Bybit HTTP 403 for {url}: {message}")
         raise BybitAPIForbidden(
             f"HTTP 403 from Bybit: {message}. This often happens when the IP is rate-limited "
             "or originates from a blocked region.",
@@ -85,7 +141,7 @@ def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str,
         )
 
     if response.status_code >= 400:
-        debug_log.log(f"Bybit HTTP {response.status_code} for {path}: {response.text}")
+        debug_log.log(f"Bybit HTTP {response.status_code} for {url}: {response.text}")
         raise BybitAPIError(
             f"Bybit HTTP error {response.status_code} while calling {path}",
             status_code=response.status_code,
@@ -94,13 +150,13 @@ def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str,
     try:
         payload = response.json()
     except ValueError as exc:
-        debug_log.log(f"Invalid JSON from Bybit {path}: {response.text[:200]}")
+        debug_log.log(f"Invalid JSON from Bybit {url}: {response.text[:200]}")
         raise BybitAPIError(f"Received invalid JSON from {path}") from exc
 
     if payload.get("retCode") != 0:
         message = payload.get("retMsg") or "Unknown error"
         ret_code = payload.get("retCode")
-        debug_log.log(f"Bybit retCode {ret_code} for {path}: {message}")
+        debug_log.log(f"Bybit retCode {ret_code} for {url}: {message}")
         raise BybitAPIError(
             f"Bybit API returned retCode={ret_code} message={message}", ret_code=ret_code
         )

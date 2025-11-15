@@ -170,7 +170,7 @@ def main() -> None:
     except bybit_api.BybitAPIForbidden as exc:
         st.error(
             "Bybit rejected the request (HTTP 403). Streamlit Cloud IPs are often blocked or rate-limited. "
-            "Set a `BYBIT_API_BASE_URL` (for example https://api.bytick.com) or provide a `BYBIT_HTTP_PROXY` "
+            "Set `BYBIT_API_BASE_URL`/`BYBIT_API_BASE_URLS` (for example https://api.bytick.com) or provide a `BYBIT_HTTP_PROXY` "
             "via Streamlit secrets/env vars to route traffic through a permitted region."
         )
         st.caption(str(exc))
