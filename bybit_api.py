@@ -28,11 +28,21 @@ class BybitAPIForbidden(BybitAPIError):
     pass
 
 
+def _load_streamlit_secrets() -> Optional[Any]:
+    if not _st:
+        return None
+    try:
+        return _st.secrets
+    except Exception as exc:  # pragma: no cover - depends on hosting env
+        debug_log.log(f"Streamlit secrets unavailable: {exc}")
+        return None
+
+
 def _get_setting(key: str) -> Optional[str]:
     env_value = os.environ.get(key)
     if env_value:
         return env_value
-    secrets = getattr(_st, "secrets", None)
+    secrets = _load_streamlit_secrets()
     if secrets and key in secrets:
         value = secrets[key]
         return str(value) if value is not None else None
@@ -43,7 +53,7 @@ def _get_setting_with_source(key: str) -> Tuple[Optional[str], Optional[str]]:
     env_value = os.environ.get(key)
     if env_value:
         return env_value, "env"
-    secrets = getattr(_st, "secrets", None)
+    secrets = _load_streamlit_secrets()
     if secrets and key in secrets:
         value = secrets[key]
         str_value = str(value) if value is not None else None
