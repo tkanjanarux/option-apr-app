@@ -167,6 +167,17 @@ def main() -> None:
             available_columns = [c for c in display_columns if c in df.columns]
             st.markdown(f"**{strategy} - Expiry: {expiry} - {days_to_expiry} days remaining**")
             st.dataframe(df[available_columns].head(top_n))
+    except bybit_api.BybitAPIForbidden as exc:
+        st.error(
+            "Bybit rejected the request (HTTP 403). Streamlit Cloud IPs are often blocked or rate-limited. "
+            "Set a `BYBIT_API_BASE_URL` (for example https://api.bytick.com) or provide a `BYBIT_HTTP_PROXY` "
+            "via Streamlit secrets/env vars to route traffic through a permitted region."
+        )
+        st.caption(str(exc))
+        return
+    except bybit_api.BybitAPIError as exc:
+        st.error(f"Unable to load Bybit option data: {exc}")
+        return
     finally:
         if show_debug_logs:
             log_text = "\n".join(debug_log.get_logs()) or "No logs captured yet."
