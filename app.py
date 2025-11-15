@@ -169,9 +169,8 @@ def main() -> None:
             st.dataframe(df[available_columns].head(top_n))
     except bybit_api.BybitAPIForbidden as exc:
         st.error(
-            "Bybit rejected the request (HTTP 403). Streamlit Cloud IPs are often blocked or rate-limited. "
-            "Set `BYBIT_API_BASE_URL`/`BYBIT_API_BASE_URLS` (for example https://api.bytick.com) or provide a `BYBIT_HTTP_PROXY` "
-            "via Streamlit secrets/env vars to route traffic through a permitted region."
+            "Bybit rejected the request (HTTP 403). The hosting IP is likely blocked for compliance reasons. "
+            "Try deploying from a different region or host with Bybit access."
         )
         st.caption(str(exc))
         return

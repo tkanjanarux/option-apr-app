@@ -1,177 +1,27 @@
 from __future__ import annotations
 
-import os
 from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+from pybit.unified_trading import HTTP
 
 import debug_log
 from shared_types import OptionQuote
 
-try:  # Streamlit secrets are only available when running inside Streamlit.
-    import streamlit as _st
-except Exception:  # pragma: no cover - optional dependency
-    _st = None
-
 
 class BybitAPIError(RuntimeError):
-    def __init__(self, message: str, *, status_code: Optional[int] = None, ret_code: Optional[int] = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.ret_code = ret_code
+    pass
 
 
 class BybitAPIForbidden(BybitAPIError):
     pass
 
 
-def _load_streamlit_secrets() -> Optional[Any]:
-    if not _st:
-        return None
-    try:
-        return _st.secrets
-    except Exception as exc:  # pragma: no cover - depends on hosting env
-        debug_log.log(f"Streamlit secrets unavailable: {exc}")
-        return None
-
-
-def _get_setting(key: str) -> Optional[str]:
-    env_value = os.environ.get(key)
-    if env_value:
-        return env_value
-    secrets = _load_streamlit_secrets()
-    if secrets and key in secrets:
-        value = secrets[key]
-        return str(value) if value is not None else None
-    return None
-
-
-def _get_setting_with_source(key: str) -> Tuple[Optional[str], Optional[str]]:
-    env_value = os.environ.get(key)
-    if env_value:
-        return env_value, "env"
-    secrets = _load_streamlit_secrets()
-    if secrets and key in secrets:
-        value = secrets[key]
-        str_value = str(value) if value is not None else None
-        return str_value, "secret"
-    return None, None
-
-
-_base_url_value, _base_url_source = _get_setting_with_source("BYBIT_API_BASE_URL")
-_base_urls_setting = _get_setting("BYBIT_API_BASE_URLS")
-_BASE_URL = _base_url_value or "https://api.bybit.com"
-_HTTP_PROXY = _get_setting("BYBIT_HTTP_PROXY")
-_USER_AGENT = _get_setting("BYBIT_API_USER_AGENT") or "option-apr-app/1.0"
-_REQUEST_TIMEOUT = float(_get_setting("BYBIT_HTTP_TIMEOUT") or 10.0)
-
-_session = requests.Session()
-_session.headers.update({"User-Agent": _USER_AGENT})
-if _HTTP_PROXY:
-    _session.proxies.update({"http": _HTTP_PROXY, "https": _HTTP_PROXY})
-    debug_log.log(f"Bybit proxy configured for requests session: {_HTTP_PROXY}")
-
-
-def _normalize_base(url: str) -> str:
-    return url.rstrip("/")
-
-
-def _build_base_url_list() -> List[str]:
-    urls: List[str] = []
-    base_url_source = _base_url_source or "default"
-    if _base_urls_setting:
-        for entry in _base_urls_setting.split(","):
-            trimmed = entry.strip()
-            if trimmed:
-                urls.append(_normalize_base(trimmed))
-        debug_log.log("Bybit base URLs sourced from BYBIT_API_BASE_URLS setting")
-    elif _base_url_value:
-        urls.append(_normalize_base(_base_url_value))
-        debug_log.log(f"Bybit base URL sourced from {_base_url_source}")
-    else:
-        debug_log.log("Bybit base URL falling back to defaults")
-
-    defaults = [
-        _normalize_base(_BASE_URL),
-        "https://api.bytick.com",
-        "https://api.bybitglobal.com",
-    ]
-    for default_url in defaults:
-        if default_url and default_url not in urls:
-            urls.append(default_url)
-
-    debug_log.log(f"Bybit API base URL options: {urls}")
-    return urls
-
-
-_BASE_URLS = _build_base_url_list()
-
-
-def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    last_error: Optional[BybitAPIError] = None
-    for base in _BASE_URLS:
-        try:
-            return _request_single(base, path, params=params)
-        except BybitAPIForbidden as exc:
-            last_error = exc
-            debug_log.log(f"Bybit request forbidden for base {base}. Trying next option…")
-            continue
-        except BybitAPIError as exc:
-            last_error = exc
-            # Retry on server-side issues; otherwise, stop.
-            if exc.status_code and exc.status_code >= 500:
-                debug_log.log(f"Bybit server error on {base}, retrying alternate base…")
-                continue
-            break
-
-    if last_error:
-        raise last_error
-    raise BybitAPIError("Failed to contact Bybit: no base URLs available")
-
-
-def _request_single(base_url: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{base_url}{path}"
-    debug_log.log(f"Bybit GET {path} base={base_url} params={params}")
-    try:
-        response = _session.get(url, params=params, timeout=_REQUEST_TIMEOUT)
-    except requests.RequestException as exc:  # pragma: no cover
-        debug_log.log(f"HTTP request to {url} failed: {exc}")
-        raise BybitAPIError(f"Failed to reach Bybit base {base_url}: {exc}") from exc
-
-    if response.status_code == 403:
-        message = response.text.strip() or response.reason
-        debug_log.log(f"Bybit HTTP 403 for {url}: {message}")
-        raise BybitAPIForbidden(
-            f"HTTP 403 from Bybit: {message}. This often happens when the IP is rate-limited "
-            "or originates from a blocked region.",
-            status_code=403,
-        )
-
-    if response.status_code >= 400:
-        debug_log.log(f"Bybit HTTP {response.status_code} for {url}: {response.text}")
-        raise BybitAPIError(
-            f"Bybit HTTP error {response.status_code} while calling {path}",
-            status_code=response.status_code,
-        )
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        debug_log.log(f"Invalid JSON from Bybit {url}: {response.text[:200]}")
-        raise BybitAPIError(f"Received invalid JSON from {path}") from exc
-
-    if payload.get("retCode") != 0:
-        message = payload.get("retMsg") or "Unknown error"
-        ret_code = payload.get("retCode")
-        debug_log.log(f"Bybit retCode {ret_code} for {url}: {message}")
-        raise BybitAPIError(
-            f"Bybit API returned retCode={ret_code} message={message}", ret_code=ret_code
-        )
-
-    return payload.get("result", {})
+def get_bybit_client() -> HTTP:
+    """Return a public Bybit HTTP client for option endpoints."""
+    return HTTP(testnet=False)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -181,27 +31,28 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _get_underlying_price(symbol: str) -> Optional[float]:
+def _get_underlying_price(client: HTTP, symbol: str) -> Optional[float]:
     spot_symbol = f"{symbol.upper()}USDT"
-    result = _request(
-        "/v5/market/tickers",
-        params={"category": "spot", "symbol": spot_symbol},
-    )
-    ticker_list = result.get("list", [])
-    if ticker_list:
-        price = _to_float(ticker_list[0].get("lastPrice"))
-        if price is not None:
+    try:
+        ticker_response = client.get_tickers(category="spot", symbol=spot_symbol)
+        if (
+            ticker_response
+            and ticker_response.get("retCode") == 0
+            and ticker_response.get("result", {}).get("list")
+        ):
+            price = float(ticker_response["result"]["list"][0]["lastPrice"])
             debug_log.log(f"Bybit underlying price for {spot_symbol}: {price}")
             return price
-    debug_log.log(f"Bybit underlying price missing for {spot_symbol}: {result}")
+        debug_log.log(
+            f"Bybit underlying response missing data for {spot_symbol}: {ticker_response}"
+        )
+    except Exception as exc:  # pragma: no cover - network failure
+        debug_log.log(f"Could not fetch underlying {symbol} price from Bybit: {exc}")
     return None
 
 
 def _normalize_premium(premium_quote: Optional[float]) -> Optional[float]:
-    """
-    Bybit option tickers report premiums in USD terms already (even for BTC-settled contracts),
-    so we simply validate/return the quoted value without any additional conversion.
-    """
+    """Premiums from Bybit are already quoted in USD terms."""
     return premium_quote
 
 
@@ -210,32 +61,78 @@ def _get_all_instruments_cached(base_coin: str) -> List[Dict[str, Any]]:
     """Fetch all option instruments for a base coin (handles pagination)."""
     instruments: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
+    local_client = get_bybit_client()
     while True:
-        params = {"category": "option", "baseCoin": base_coin}
-        if cursor:
-            params["cursor"] = cursor
-        result = _request("/v5/market/instruments-info", params=params)
+        try:
+            response = local_client.get_instruments_info(
+                category="option",
+                baseCoin=base_coin,
+                cursor=cursor,
+            )
+        except Exception as exc:  # pragma: no cover
+            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
+            break
+
+        if not (response and response.get("retCode") == 0):
+            error_msg = response.get("retMsg") if response else "Unknown error"
+            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
+            break
+
+        result = response.get("result", {})
         instruments.extend(result.get("list", []))
         cursor = result.get("nextPageCursor")
         if not cursor:
             break
 
-    debug_log.log(f"Bybit instruments for {base_coin}: {len(instruments)} rows")
     return instruments
 
 
-def _get_all_instruments(base_coin: str) -> List[Dict[str, Any]]:
-    # Use cached data when available; if cache is empty fall back to live fetch.
+def _get_all_instruments(client: HTTP, base_coin: str) -> List[Dict[str, Any]]:
     instruments = _get_all_instruments_cached(base_coin)
     if instruments:
         return instruments
-    return []
+
+    instruments = []
+    cursor: Optional[str] = None
+    while True:
+        try:
+            response = client.get_instruments_info(
+                category="option",
+                baseCoin=base_coin,
+                cursor=cursor,
+            )
+        except Exception as exc:  # pragma: no cover
+            debug_log.log(f"Failed to list instruments for {base_coin}: {exc}")
+            break
+
+        if not (response and response.get("retCode") == 0):
+            error_msg = response.get("retMsg") if response else "Unknown error"
+            debug_log.log(f"Error fetching instruments for {base_coin}: {error_msg}")
+            break
+
+        result = response.get("result", {})
+        instruments.extend(result.get("list", []))
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+
+    return instruments
 
 
-def _get_option_tickers(base_coin: str) -> Dict[str, Dict[str, Any]]:
+def _get_option_tickers(client: HTTP, base_coin: str) -> Dict[str, Dict[str, Any]]:
     """Return the latest quotes for every option under the base coin."""
-    result = _request("/v5/market/tickers", params={"category": "option", "baseCoin": base_coin})
-    ticker_list = result.get("list", [])
+    try:
+        response = client.get_tickers(category="option", baseCoin=base_coin)
+    except Exception as exc:  # pragma: no cover
+        debug_log.log(f"Failed to fetch option tickers for {base_coin}: {exc}")
+        return {}
+
+    if not (response and response.get("retCode") == 0):
+        error_msg = response.get("retMsg") if response else "Unknown error"
+        debug_log.log(f"Error fetching option tickers for {base_coin}: {error_msg}")
+        return {}
+
+    ticker_list = response.get("result", {}).get("list", [])
     target_symbol = "BTC-10NOV25-102000-P-USDT"
     for item in ticker_list:
         if item.get("symbol") == target_symbol:
@@ -244,20 +141,24 @@ def _get_option_tickers(base_coin: str) -> Dict[str, Dict[str, Any]]:
     return {item["symbol"]: item for item in ticker_list}
 
 
-def _get_ticker_for_symbol(option_symbol: str) -> Optional[Dict[str, Any]]:
-    """Fetch a single option ticker snapshot. Used as a fallback when the bulk call is missing a symbol."""
-    result = _request("/v5/market/tickers", params={"category": "option", "symbol": option_symbol})
-    ticker_list = result.get("list", [])
+def _get_ticker_for_symbol(client: HTTP, option_symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single option ticker snapshot when bulk call misses a symbol."""
+    try:
+        response = client.get_tickers(category="option", symbol=option_symbol)
+    except Exception as exc:  # pragma: no cover
+        debug_log.log(f"Failed to fetch ticker for {option_symbol}: {exc}")
+        return None
+
+    if not (response and response.get("retCode") == 0):
+        error_msg = response.get("retMsg") if response else "Unknown error"
+        debug_log.log(f"Error fetching ticker for {option_symbol}: {error_msg}")
+        return None
+
+    ticker_list = response.get("result", {}).get("list", [])
     return ticker_list[0] if ticker_list else None
 
 
 def _parse_option_symbol(option_symbol: str) -> Optional[Tuple[str, float, str]]:
-    """
-    Parse Bybit option symbol into (expiry, strike, option_type).
-    Option symbol formats:
-      BTC-29NOV24-65000-C
-      BTC-29NOV24-65000-C-USDT
-    """
     parts = option_symbol.split("-")
     if len(parts) < 4:
         return None
@@ -278,12 +179,10 @@ def _parse_option_symbol(option_symbol: str) -> Optional[Tuple[str, float, str]]
     return expiry, strike, option_type
 
 
-
-
 def list_option_expiries(symbol: str) -> List[str]:
-    """Return available expiry dates for the given symbol from Bybit."""
     base_coin = symbol.upper()
-    instruments = _get_all_instruments(base_coin)
+    client = get_bybit_client()
+    instruments = _get_all_instruments(client, base_coin)
     expiries = set()
     for instrument in instruments:
         parsed = _parse_option_symbol(instrument.get("symbol", ""))
@@ -301,19 +200,19 @@ def fetch_cash_secured_put_quotes(symbol: str, expiry: str) -> List[OptionQuote]
 
 
 def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[OptionQuote]:
-    """Fetch option quotes from Bybit."""
     base_coin = symbol.upper()
-    underlying_price = _get_underlying_price(base_coin)
+    client = get_bybit_client()
+    underlying_price = _get_underlying_price(client, base_coin)
     if underlying_price is None or underlying_price <= 0:
         debug_log.log(f"Could not determine underlying price for {symbol}.")
         return []
 
-    instrument_list = _get_all_instruments(base_coin)
+    instrument_list = _get_all_instruments(client, base_coin)
     if not instrument_list:
         debug_log.log(f"No instruments returned for {symbol.upper()} when fetching {expiry}.")
         return []
 
-    option_tickers = _get_option_tickers(base_coin)
+    option_tickers = _get_option_tickers(client, base_coin)
 
     quotes: List[OptionQuote] = []
     debug_log.log(
@@ -360,7 +259,7 @@ def _fetch_bybit_quotes(symbol: str, expiry: str, option_type: str) -> List[Opti
 
         ticker_snapshot = option_tickers.get(option_symbol)
         if not ticker_snapshot:
-            ticker_snapshot = _get_ticker_for_symbol(option_symbol)
+            ticker_snapshot = _get_ticker_for_symbol(client, option_symbol)
         if not ticker_snapshot:
             skip_reasons["missing_ticker"] += 1
             debug_log.log(f"Missing ticker snapshot for {option_symbol}")
